@@ -1,0 +1,90 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Directory metadata
+.directory
+
+# Temporary files
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# Log files
+*.log
+
+# Build artifacts and directories
+**/build/
+build/
+*.o
+*.a
+*.out
+*.exe
+
+# ESP-IDF specific build outputs
+*.bin
+*.elf
+*.map
+flasher_args.json
+sdkconfig.old
+sdkconfig
+
+# ESP-IDF dependencies
+/components/.idf/
+**/components/.idf/
+managed_components/
+.espressif/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+
+# Python environment files
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.egg-info/
+dist/
+
+# Virtual environment folders
+venv/
+.venv/
+env/
+
+# Language Servers
+.clangd/
+.ccls-cache/
+compile_commands.json
+
+# Windows specific
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Dependency lock (auto-generated, but keep for reproducibility)
+# dependencies.lock — explicitly NOT ignored
+
+# User-specific configuration files
+*.user
+*.workspace
+*.suo
+*.sln.docstates
+
+# VS Code machine-specific settings (contains absolute paths)
+.vscode/settings.json
+.vscode/c_cpp_properties.json
+
+# Large font binary (raw TTF, not the pre-rendered bitmap font)
+NotoSansSC-Regular.ttf
+
+# Internal development tooling (optional: comment out if you want to share)
+.claude/
+.workbuddy/
+.codex/

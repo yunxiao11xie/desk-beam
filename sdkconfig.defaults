@@ -1,0 +1,72 @@
+# This file was generated using idf.py save-defconfig or menuconfig [D] key. It can be edited manually.
+# Espressif IoT Development Framework (ESP-IDF) 6.2.0 Project Minimal Configuration
+#
+# default:
+CONFIG_IDF_TARGET="esp32s31"
+
+#
+# Partition Table (custom: 8MB factory for embedded bitmap fonts)
+#
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# end of Partition Table
+
+#
+# Serial flasher config
+#
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# end of Serial flasher config
+
+#
+# Component config
+#
+
+#
+# ESP PSRAM
+#
+CONFIG_SPIRAM=y
+# end of ESP PSRAM
+
+#
+# ESP WebSocket Client
+#
+CONFIG_ESP_WEBSOCKET_CLIENT_ENABLE=y
+# end of ESP WebSocket Client
+
+#
+# ESP LVGL PORT
+#
+CONFIG_LVGL_PORT_ENABLE_PPA=y
+# end of ESP LVGL PORT
+
+#
+# LVGL configuration
+#
+CONFIG_LV_MEM_CUSTOM=y
+
+#
+# Font usage
+#
+
+#
+# Enable built-in fonts
+#
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+# end of Enable built-in fonts
+
+#
+# Bitmap font compressed (RLE), required for font_noto_sc_28.c
+#
+CONFIG_LV_USE_FONT_COMPRESSED=y
+# end of Font usage
+
+#
+# Widgets
+#
+CONFIG_LV_USE_CHART=y
+# end of Widgets
+
+# end of LVGL configuration
+# end of Component config
