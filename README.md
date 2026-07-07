@@ -394,9 +394,11 @@ desk-beam/
 
 ---
 
+## 给个Star⭐️        
+
 ## 📄 License
 
-MIT © 2026 Yunxiao Xie
+MIT © 2026 Yunxiao11Xie
 
 ---
 
