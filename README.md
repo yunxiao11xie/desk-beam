@@ -19,10 +19,12 @@
 
 **desk-beam** 是一个基于 ESP32-S31 的桌面副屏，通过 WiFi/WebSocket 连接 PC 端服务，实现：
 
-- 🎵 **桌面歌词显示** — 同步 QQ 音乐/网易云等播放器的滚动歌词
+- 🎵 **桌面歌词 + 专辑封面** — 同步 QQ 音乐/网易云等播放器的滚动歌词与封面
+- 🖼️ **专辑封面显示** — Now Playing 模式展示当前歌曲封面（v2.0.0 新增）
 - 💡 **WS2812 氛围灯** — 随音乐律动（脉冲/呼吸/彩虹）
 - 🎮 **音乐遥控器** — 通过 ADC 按键远程控制播放
 - 📊 **DeepSeek 用量监控** — 实时查看 API 余额和消耗
+- 🗂️ **SD 卡存储** — 歌词/封面缓存及配置存储（v2.0.0 新增）
 
 ```
 QQ音乐/网易云 → Windows SMTC → PC 桥接服务 → WebSocket → ESP32 → LVGL 屏幕 + WS2812
@@ -40,15 +42,17 @@ QQ音乐/网易云 → Windows SMTC → PC 桥接服务 → WebSocket → ESP32 
 - **WebSocket 全双工** — 自动重连（指数退避）+ JSON 协议
 - **SD 卡支持** — SDMMC 4-bit FATFS 挂载（可选）
 - **触摸交互** — GT1151 触摸 + ADC 按键双输入
-- **专辑封面缓存** (计划中) — SD 卡存储 PC 端推送的专辑封面图，减少网络依赖
+- **专辑封面显示** — Now Playing 模式展示 SD 卡缓存的专辑封面图
 
 ---
 
 ## 🖥️ 演示
 
-| 音乐歌词屏 | DeepSeek 用量屏 |
-|:---:|:---:|
-| ![音乐歌词屏](image/music.jpg) | ![DeepSeek 用量屏](image/deepseek_usage.jpg) |
+| 音乐歌词屏 | 专辑封面屏（v2.0.0） | DeepSeek 用量屏 |
+|:---:|:---:|:---:|
+| ![音乐歌词屏](image/music.jpg) | ![专辑封面](image/music1.jpg) | ![DeepSeek 用量屏](image/deepseek_usage.jpg) |
+| DeepSeek 用量改进（v2.0.0） | 歌词页新界面（v2.0.0） | |
+| ![DeepSeek 改进](image/deepseek_usage1.jpg) | ![歌词新界面](image/music2.jpg) | |
 
 ---
 
