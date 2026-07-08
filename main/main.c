@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief desk-beam — ESP32-S31 桌面副屏伴侣 — 主程序入口
+ * @brief ESP32-S31-Korvo 桌面音乐伴侣 — 主程序入口
  *
  * 仅负责模块初始化编排，不含业务逻辑。
  *
@@ -47,13 +47,13 @@ static const char *TAG = "main";
  * ═══════════════════════════════════════════════════════════════════ */
 
 /** WiFi 名称（2.4 GHz） */
-#define WIFI_SSID       "xxxxxxxx"
+#define WIFI_SSID       "XXXXXX"
 
 /** WiFi 密码 */
-#define WIFI_PASSWORD   "xxxxxxxxx"
+#define WIFI_PASSWORD   "XXXXXXXXXXXXXXX"
 
 /** 运行 windows_media_server.py 的 PC IP 地址 */
-#define PC_HOST         "192.168.xxx.xxx"
+#define PC_HOST         "XXXXXXXXXXXXXXXX"
 
 /** PC WebSocket 服务器端口（默认 8765） */
 #define PC_WS_PORT      8765
@@ -122,7 +122,7 @@ static void network_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "============================================");
-    ESP_LOGI(TAG, "  desk-beam — ESP32-S31 桌面副屏伴侣");
+    ESP_LOGI(TAG, "  ESP32-S31-Korvo 桌面音乐伴侣");
     ESP_LOGI(TAG, "  屏幕: %dx%d RGB565", LCD_H_RES, LCD_V_RES);
     ESP_LOGI(TAG, "  WiFi: %s", WIFI_SSID);
     ESP_LOGI(TAG, "  PC:   %s:%d", PC_HOST, PC_WS_PORT);

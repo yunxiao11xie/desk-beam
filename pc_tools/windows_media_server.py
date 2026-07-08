@@ -24,6 +24,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
 import re
 import socket
 import time
@@ -41,6 +42,15 @@ import websockets
 # -----------------------------------------------------------------------
 DEEPSEEK_API_KEY = ""   # 不再使用 API Key 模式，改用文件模式
 DEEPSEEK_FILE = "D:\\claude_code\\deepseek_usage_data.json"
+
+# -----------------------------------------------------------------------
+# 封面广播调试开关
+# 设置环境变量 DISABLE_COVER=1 可关闭封面广播（不重编 ESP32 即可隔离
+# “屏幕闪烁是否由封面路径引起”）。默认开启封面广播。
+# -----------------------------------------------------------------------
+COVER_BROADCAST = os.environ.get("DISABLE_COVER", "").lower() not in (
+    "1", "true", "yes", "on"
+)
 
 # DeepSeek 模型定价 (元/1M tokens) — 用于 usage_detail 回退计算
 # 参考: https://api-docs.deepseek.com/zh-cn/quick_start/pricing
@@ -219,6 +229,7 @@ class MediaServer:
         self.last_song_key: tuple[str, str, str, int] | None = None  # 上一次的歌曲 key，用于检测换歌
         self.lyrics_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}  # 歌词缓存 { (title, artist): [...] }
         self.paused: bool = False                  # 暂停广播标志：暂停时仍监听 SMTC，但不推送数据
+        self.last_cover_b64: str | None = None     # 最近一次封面 base64 缓存（新客户端连上立即推送）
 
     # ------------------------------------------------------------------
     # 生命周期管理
@@ -278,6 +289,7 @@ class MediaServer:
             # 客户端刚连上，立即推送当前状态，避免等待下一次轮询
             await websocket.send(json.dumps(self.song.to_payload(), ensure_ascii=False))
             await self.send_lyrics(websocket, self.song)
+            await self.send_cover(websocket)               # 立即推送当前封面
             await self.send_deepseek_to_client(websocket)  # DeepSeek 用量缓存
             # 告知客户端当前的暂停状态
             if self.paused:
@@ -414,9 +426,23 @@ class MediaServer:
             # 歌词查询是 HTTP 请求，用 asyncio.to_thread 避免阻塞事件循环
             lyrics = await asyncio.to_thread(self.fetch_lyrics, song)
             print(f"Lyrics lines: {len(lyrics)}")
+            # 封面提取（SMTC 缩略图 → JPEG → base64），与换歌同步
+            # 调试开关 DISABLE_COVER=1 时跳过，用于隔离封面路径问题
+            cover_b64 = None
+            if COVER_BROADCAST:
+                cover_b64 = await self.fetch_cover_art(song, media)
+                if cover_b64:
+                    self.last_cover_b64 = cover_b64
             if not self.paused:
                 await self.broadcast(song.to_payload())
                 await self.broadcast({"type": "lyrics", "lines": lyrics})
+                if cover_b64:
+                    await self.broadcast({
+                        "type": "cover_art",
+                        "title": song.title,
+                        "artist": song.artist,
+                        "data": cover_b64,
+                    })
         elif position_jump or state_changed:
             # ---- 进度跳转或状态变化，暂停时也暂不广播 ----
             if not self.paused:
@@ -612,6 +638,7 @@ class MediaServer:
             # 恢复时立即推送最新状态，让客户端快速追上
             await self.broadcast(self.song.to_payload("song_info"))
             await self.send_lyrics_to_all()
+            await self.send_cover_to_all()
             await self.notify_pause_state()
 
     async def notify_pause_state(self) -> None:
@@ -627,6 +654,113 @@ class MediaServer:
         lyrics = self.lyrics_cache.get((self.song.title, self.song.artist), [])
         if lyrics:
             await self.broadcast({"type": "lyrics", "lines": lyrics})
+
+    async def send_cover(self, websocket: Any) -> None:
+        """
+        向指定客户端发送缓存的封面数据（base64）。
+
+        新客户端刚连上时立即推送当前封面，无需等待下一次换歌。
+        """
+        if COVER_BROADCAST and self.last_cover_b64:
+            await websocket.send(json.dumps({
+                "type": "cover_art",
+                "title": self.song.title,
+                "artist": self.song.artist,
+                "data": self.last_cover_b64,
+            }, ensure_ascii=False))
+
+    async def send_cover_to_all(self) -> None:
+        """向所有客户端广播缓存的封面数据。"""
+        if COVER_BROADCAST and self.last_cover_b64:
+            await self.broadcast({
+                "type": "cover_art",
+                "title": self.song.title,
+                "artist": self.song.artist,
+                "data": self.last_cover_b64,
+            })
+
+    async def fetch_cover_art(self, song: SongInfo,
+                              media: Any = None) -> str | None:
+        """
+        获取当前 SMTC 专辑封面 → 等比缩放至最长边 800px → JPEG(q75) → base64。
+
+        实现要点（winsdk）：
+          - thumbnail 是 IRandomAccessStreamReference（流引用），必须显式
+            await 其 open_read_async() 得到真正的可读流，否则会永久挂起。
+          - 读取流内容用 Buffer + read_async，再经 DataReader.from_buffer()
+            + read_bytes() 转成 bytes。
+          - 整个封面读取加 3s 超时，避免阻塞轮询循环。
+
+        返回:
+          封面 JPEG 的 base64 字符串；获取失败 / 无封面时返回 None。
+        """
+        if self.session is None:
+            return None
+        try:
+            # ---- 1. 取得缩略图流引用 ----
+            # winsdk 部分版本未暴露 session.try_get_thumbnail_async，
+            # 因此优先使用 media.thumbnail（来自媒体属性，最可靠）。
+            from winsdk.windows.foundation import Size
+            thumb_ref = getattr(media, "thumbnail", None) if media is not None else None
+            if thumb_ref is None:
+                # 备选项：会话级缩略图请求（部分 winsdk 版本支持）
+                try:
+                    thumb_ref = await self.session.try_get_thumbnail_async(Size(800, 800))
+                except Exception:
+                    thumb_ref = None
+            if thumb_ref is None:
+                return None
+
+            # ---- 2. 打开流并读取全部字节（必须 await，否则挂起） ----
+            stream = await asyncio.wait_for(thumb_ref.open_read_async(), timeout=3.0)
+            if stream is None:
+                return None
+
+            from winsdk.windows.storage.streams import (
+                DataReader, Buffer, InputStreamOptions,
+            )
+            # 循环读取，直到流结束（read_async 不保证一次读完）
+            full = bytearray()
+            while True:
+                buf = Buffer(256 * 1024)  # 256KB 分块
+                read_op = stream.read_async(
+                    buf, buf.capacity, InputStreamOptions.PARTIAL
+                )
+                await asyncio.wait_for(read_op, timeout=3.0)
+                if buf.length == 0:
+                    break  # 流已结束
+                chunk = bytearray(buf.length)
+                DataReader.from_buffer(buf).read_bytes(chunk)  # winsdk: 填入可变 bytearray
+                full += chunk
+            raw = bytes(full)
+            if not raw:
+                return None
+
+            # ---- 3. 解码 + 等比缩放（最长边 800）+ 重新编码 JPEG ----
+            try:
+                from io import BytesIO
+                from PIL import Image
+            except ImportError:
+                print("  cover art: 未安装 Pillow，原样发送原始封面字节")
+                return base64.b64encode(raw).decode()
+
+            img = Image.open(BytesIO(raw))
+            w, h = img.size
+            max_dim = 800
+            if w > max_dim or h > max_dim:
+                ratio = max_dim / max(w, h)
+                nw, nh = max(1, int(w * ratio)), max(1, int(h * ratio))
+                img = img.resize((nw, nh), Image.LANCZOS)
+            img = img.convert("RGB")  # JPEG 不支持透明通道
+            out = BytesIO()
+            img.save(out, format="JPEG", quality=75)
+            jpeg_bytes = out.getvalue()
+            print(f"  cover art: {w}x{h} → {img.size[0]}x{img.size[1]}, "
+                  f"{len(jpeg_bytes)} bytes")
+            return base64.b64encode(jpeg_bytes).decode()
+        except Exception as exc:
+            print(f"  cover art fetch failed: {exc}")
+            return None
 
     async def keyboard_listener(self) -> None:
         """

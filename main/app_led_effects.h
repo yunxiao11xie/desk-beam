@@ -88,6 +88,18 @@ void app_led_trigger_pulse(uint8_t r, uint8_t g, uint8_t b);
 void app_led_effects_set_playing(bool playing);
 
 /**
+ * @brief 设置氛围灯微光基色（无脉冲时显示的颜色）
+ *
+ * 由 app_music_screen 在设置专辑封面时调用，传入封面主色；
+ * 无封面时传入柔和默认色。PULSE 模式下，歌词脉冲结束后回到该基色。
+ *
+ * @param r 红色分量 (0~255)
+ * @param g 绿色分量 (0~255)
+ * @param b 蓝色分量 (0~255)
+ */
+void app_led_effects_set_base_color(uint8_t r, uint8_t g, uint8_t b);
+
+/**
  * @brief 设置全局亮度（0~255）
  *
  * 影响所有效果模式的最终输出亮度。

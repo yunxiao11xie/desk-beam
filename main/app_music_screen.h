@@ -137,6 +137,17 @@ music_display_mode_t app_music_screen_get_mode(void);
  */
 void app_music_screen_cycle_mode(void);
 
+/**
+ * @brief 设置专辑封面背景（SD 卡 JPEG 路径）
+ *
+ * 内部用 ESP32-S31 硬件 JPEG 解码器 + PPA 缩放为 RGB565，全屏 cover-fit 填充（溢出部分居中裁切），
+ * 叠加半透明黑色遮罩压暗以保证歌词可读。path 为 NULL 或空字符串时清除封面、
+ * 恢复纯黑背景。
+ *
+ * @param path SD 卡上 JPEG 文件路径（如 /sdcard/covers/xxxx.jpg）
+ */
+void app_music_screen_set_cover(const char *path);
+
 #ifdef __cplusplus
 }
 #endif

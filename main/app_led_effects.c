@@ -85,8 +85,13 @@ static uint32_t s_breath_tick = 0;
 /* 彩虹色相 (0~360) */
 static uint16_t s_rainbow_hue = 0;
 
-/* 最后一帧输出的颜色（用于微光保持） */
-static uint8_t s_last_r = 80, s_last_g = 220, s_last_b = 255;
+/* 微光基色（无脉冲/无封面时显示；默认柔和青白，由 set_cover 覆盖为封面主色） */
+#define LED_BASE_DEFAULT_R  200
+#define LED_BASE_DEFAULT_G  225
+#define LED_BASE_DEFAULT_B  250
+static uint8_t s_base_r = LED_BASE_DEFAULT_R;
+static uint8_t s_base_g = LED_BASE_DEFAULT_G;
+static uint8_t s_base_b = LED_BASE_DEFAULT_B;
 
 
 /* ================================================================
@@ -144,10 +149,10 @@ static void render_pulse(void)
             render_rainbow();
             return;
         }
-        /* 播放中 → 保持最后一帧颜色的微光 */
-        uint8_t r = (uint8_t)((float)s_last_r * AMBIENT_BRIGHTNESS);
-        uint8_t g = (uint8_t)((float)s_last_g * AMBIENT_BRIGHTNESS);
-        uint8_t b = (uint8_t)((float)s_last_b * AMBIENT_BRIGHTNESS);
+        /* 播放中 → 保持微光基色（封面主色或柔和默认色） */
+        uint8_t r = (uint8_t)((float)s_base_r * AMBIENT_BRIGHTNESS);
+        uint8_t g = (uint8_t)((float)s_base_g * AMBIENT_BRIGHTNESS);
+        uint8_t b = (uint8_t)((float)s_base_b * AMBIENT_BRIGHTNESS);
         apply_brightness(&r, &g, &b);
         hal_led_set_rgb(r, g, b);
         return;
@@ -164,13 +169,9 @@ static void render_pulse(void)
         float t = (float)(s_pulse.elapsed_ms - PULSE_ATTACK_MS) / PULSE_DECAY_MS;
         ratio = PULSE_PEAK - (PULSE_PEAK - PULSE_DECAY_END) * t;
     } else {
-        /* 脉冲结束 */
+        /* 脉冲结束 → 回到 IDLE（微光基色 s_base） */
         s_pulse.active = false;
         s_pulse.elapsed_ms = 0;
-        /* 保存颜色用于微光 */
-        s_last_r = s_pulse.r;
-        s_last_g = s_pulse.g;
-        s_last_b = s_pulse.b;
         render_pulse();  /* 递归 → 进入 IDLE 分支 */
         return;
     }
@@ -302,6 +303,13 @@ void app_led_trigger_pulse(uint8_t r, uint8_t g, uint8_t b)
 void app_led_effects_set_playing(bool playing)
 {
     s_playing = playing;
+}
+
+void app_led_effects_set_base_color(uint8_t r, uint8_t g, uint8_t b)
+{
+    s_base_r = r;
+    s_base_g = g;
+    s_base_b = b;
 }
 
 void app_led_effects_set_brightness(uint8_t brightness)

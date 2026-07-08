@@ -660,6 +660,9 @@ void app_deepseek_screen_update_data(
             if (daily_usage[i] > max_cost) max_cost = daily_usage[i];
         }
 
+        ESP_LOGD(TAG, "柱状图: count=%d, max_cost=%.3f",
+                 n, (double)max_cost);
+
         const lv_coord_t bar_bottom = DAILY_BAR_H + 4;
 
         for (int i = 0; i < DAILY_USAGE_MAX_DAYS; i++) {
@@ -716,10 +719,15 @@ void app_deepseek_screen_update_data(
         format_with_commas(buf, sizeof(buf), models[i].tokens);
         lv_label_set_text(s_table_tokens[i], buf);
 
-        lv_snprintf(buf, sizeof(buf), "%.2f%%",
-                    (total_tokens > 0)
-                        ? (double)models[i].tokens * 100.0 / total_tokens
-                        : 0.0);
+        /* 占比 = 模型tokens / 总tokens。用整数运算避免依赖 lv_snprintf 的 %f
+         * 浮点格式（sdkconfig 未开启 CONFIG_LV_SPRINTF_USE_FLOAT，否则 %.2f
+         * 会被原样输出成 "f%"）。显示如 90.00% */
+        uint32_t pct_x100 = (total_tokens > 0)
+            ? (uint32_t)((uint64_t)models[i].tokens * 10000 / total_tokens)
+            : 0;
+        lv_snprintf(buf, sizeof(buf), "%lu.%02lu%%",
+                    (unsigned long)(pct_x100 / 100),
+                    (unsigned long)(pct_x100 % 100));
         lv_label_set_text(s_table_pct[i], buf);
 
         lv_obj_clear_flag(s_table_name[i], LV_OBJ_FLAG_HIDDEN);

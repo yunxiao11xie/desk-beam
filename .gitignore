@@ -22,20 +22,23 @@ build/
 *.o
 *.a
 *.out
-*.exe
+*.exe # For any host-side utilities compiled on Windows
 
 # ESP-IDF specific build outputs
 *.bin
 *.elf
 *.map
-flasher_args.json
+flasher_args.json # Generated in build directory
 sdkconfig.old
 sdkconfig
 
 # ESP-IDF dependencies
+# For older versions or manual component management
 /components/.idf/
 **/components/.idf/
+# For modern ESP-IDF component manager
 managed_components/
+# If ESP-IDF tools are installed/referenced locally to the project
 .espressif/
 
 # CMake generated files
@@ -68,23 +71,8 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
-# Dependency lock (auto-generated, but keep for reproducibility)
-# dependencies.lock — explicitly NOT ignored
-
 # User-specific configuration files
 *.user
-*.workspace
-*.suo
-*.sln.docstates
-
-# VS Code machine-specific settings (contains absolute paths)
-.vscode/settings.json
-.vscode/c_cpp_properties.json
-
-# Large font binary (raw TTF, not the pre-rendered bitmap font)
-NotoSansSC-Regular.ttf
-
-# Internal development tooling (optional: comment out if you want to share)
-.claude/
-.workbuddy/
-.codex/
+*.workspace # General workspace files, can be from various tools
+*.suo       # Visual Studio Solution User Options
+*.sln.docstates # Visual Studio

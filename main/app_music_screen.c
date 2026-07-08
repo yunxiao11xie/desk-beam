@@ -33,6 +33,14 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+
+#include "esp_heap_caps.h"
+#include "driver/jpeg_decode.h"     /* ESP32-S31 硬件 JPEG 编解码器 */
+#include "driver/ppa.h"             /* PPA 硬件缩放引擎 */
+#include "esp_cache.h"              /* PPA→PSRAM cache 同步 */
 
 /* 预渲染 Bitmap 字库 (编译进固件) */
 LV_FONT_DECLARE(font_noto_sc_20);
@@ -186,6 +194,21 @@ static lv_obj_t *s_sep_right      = NULL;   /* 右分隔线 */
 static lv_obj_t *s_progress_bg    = NULL;
 static lv_obj_t *s_progress_fg    = NULL;
 
+/* ---- 专辑封面背景 ---- */
+static lv_obj_t    *s_cover_img    = NULL;   /* 全屏封面图 */
+static lv_obj_t    *s_cover_darken = NULL;   /* 半透明黑色遮罩 */
+static lv_img_dsc_t *s_cover_dsc   = NULL;   /* 解码后的封面描述符（内部 DRAM） */
+static uint8_t     *s_cover_fb     = NULL;   /* 解码后的 RGB565 帧缓冲（PSRAM，PPA 可读） */
+
+/* 封面主色调色板（供氛围灯取色，歌词行切换时循环使用） */
+#define COVER_PAL_MAX   5
+#define LED_SOFT_R      200
+#define LED_SOFT_G      225
+#define LED_SOFT_B      250
+static uint8_t  s_cover_palette[COVER_PAL_MAX][3];
+static int      s_cover_palette_n = 0;
+static int      s_cover_palette_idx = 0;
+
 /* ═══════════════════════════════════════════════════════════════
  *  预渲染 Bitmap 字库
  *  使用 font_noto_sc_20.c + font_noto_sc_28.c 编译进固件
@@ -267,7 +290,7 @@ static void update_progress(void)
 static void update_play_icon(void)
 {
     if (s_play_icon == NULL) return;
-    lv_label_set_text(s_play_icon, s_is_playing ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
+    lv_label_set_text(s_play_icon, s_is_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
 }
 
 /* ---- 播放模式图标 ---- */
@@ -338,6 +361,9 @@ static void scroll_anim_exec_cb(void *var, int32_t v)
 /* 前向声明 — update_lyrics_display 引用 scroll_anim_ready_cb */
 static void scroll_anim_ready_cb(lv_anim_t *a);
 
+/* 前向声明 — update_lyrics_display 引用（定义见封面取色段） */
+static void led_trigger_cover_pulse(void);
+
 /* ---- 歌词 6 行更新（带动画） ---- */
 static void update_lyrics_display(int line_idx)
 {
@@ -352,9 +378,9 @@ static void update_lyrics_display(int line_idx)
     /* 同一行 → 不动 */
     if (line_idx == s_last_displayed) return;
 
-    /* 歌词行切换 → 触发氛围灯脉冲 */
+    /* 歌词行切换 → 触发氛围灯脉冲（封面调色板循环取色） */
     if (line_idx >= 0) {
-        app_led_trigger_pulse(80, 220, 255);  /* 青蓝色，与当前行高亮色一致 */
+        led_trigger_cover_pulse();
     }
 
     /* 大幅度跳转（>2 行）→ 立即刷新，不做动画 */
@@ -858,8 +884,446 @@ static void create_info(void)
     lv_obj_set_pos(s_info_uptime_label, 40, y);
 }
 
+/* === 专辑封面背景（SD 卡 JPEG → 硬件解码 → PPA 缩放 → RGB565 → lv_img） ===
+ *
+ * 使用 ESP32-S31 内置硬件 JPEG 解码器 + PPA SRM 引擎：
+ *   - 硬件解码 JPEG → RGB565 输出到 PSRAM（2D-DMA 传输，不占 CPU）
+ *   - PPA 硬件缩放 ≤160×160 → 内部 DRAM 帧缓冲
+ *   - 完全绕过 picolibc FILE 池问题、POSIX read/lseek 等软件栈 */
+
+/* 对齐到 16 像素边界（硬件 JPEG 解码器输出要求） */
+#define COVER_ALIGN_16(v)  (((v) + 15) & ~15)
+
+/* 向上圆整到 cache line (64B) 边界，供 esp_cache_msync 使用 */
+#define CACHE_ALIGN_UP(s)  (((size_t)(s) + 0x3F) & ~(size_t)0x3F)
+
+/* 硬件解码 SD 卡 JPEG → RGB565 帧缓冲（失败返回 NULL）
+ *
+ * 流程：读取整个 JPEG → jpeg_decoder_get_info → jpeg_decoder_process
+ * → PPA SRM 缩放 → 返回 RGB565 帧缓冲（内部 DRAM，≤51KB）
+ *
+ * 全尺寸解码输出走 PSRAM（通过 jpeg_alloc_decoder_mem），
+ * 最终封面帧缓冲走内部 DRAM（lpgl 图像描述符需要）。 */
+static uint8_t *decode_cover_to_rgb565(const char *path, uint16_t *out_w, uint16_t *out_h)
+{
+    /* ---- 1. 读取整个 JPEG 文件到内存 ---- */
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { ESP_LOGW(TAG, "封面打开失败: %s", path); return NULL; }
+    off_t sz = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
+    if (sz <= 2) { close(fd); return NULL; }
+    uint8_t *jpg_buf = malloc((size_t)sz);
+    if (!jpg_buf) { close(fd); return NULL; }
+    ssize_t rd = read(fd, jpg_buf, (size_t)sz);
+    close(fd);
+    if (rd != sz) { free(jpg_buf); return NULL; }
+
+    /* ---- 2. 解析 JPEG 头（纯软件，无需硬件引擎） ---- */
+    jpeg_decode_picture_info_t info;
+    if (jpeg_decoder_get_info(jpg_buf, (uint32_t)sz, &info) != ESP_OK) {
+        ESP_LOGW(TAG, "封面 JPEG 头解析失败");
+        free(jpg_buf); return NULL;
+    }
+    uint32_t iw = info.width, ih = info.height;
+    ESP_LOGD(TAG, "封面: %lu×%lu, 采样=%d, 文件=%lu bytes",
+             (unsigned long)iw, (unsigned long)ih, info.sample_method, (unsigned long)sz);
+
+    /* ---- 3. 计算缩放参数（长边 ≤320px，留足全屏背景细节） ---- */
+    int scale_log2 = 0;
+    while (scale_log2 < 3 && ((iw >> scale_log2) > 320 || (ih >> scale_log2) > 320))
+        scale_log2++;
+    uint16_t ow = (uint16_t)(iw >> scale_log2);
+    uint16_t oh = (uint16_t)(ih >> scale_log2);
+    size_t fb_size = (size_t)ow * oh * 2;       /* RGB565 */
+
+    /* ---- 4. 分配全尺寸硬件解码输出缓冲（PSRAM，DMA 对齐） ---- */
+    uint32_t padded_w = COVER_ALIGN_16(iw);
+    uint32_t padded_h = COVER_ALIGN_16(ih);
+    size_t full_res_size = (size_t)padded_w * padded_h * 2;
+
+    jpeg_decode_memory_alloc_cfg_t mem_cfg = {
+        .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,
+    };
+    size_t alloc_size = 0;
+    uint8_t *full_buf = (uint8_t *)jpeg_alloc_decoder_mem(
+        full_res_size, &mem_cfg, &alloc_size);
+    if (!full_buf) {
+        ESP_LOGE(TAG, "封面解码缓冲分配失败 (%zu bytes)", full_res_size);
+        free(jpg_buf); return NULL;
+    }
+
+    /* ---- 5. 创建硬件解码引擎 ---- */
+    jpeg_decoder_handle_t jpeg_hdl = NULL;
+    jpeg_decode_engine_cfg_t eng_cfg = { .timeout_ms = 80 };
+    if (jpeg_new_decoder_engine(&eng_cfg, &jpeg_hdl) != ESP_OK) {
+        free(jpg_buf); heap_caps_free(full_buf); return NULL;
+    }
+
+    /* ---- 6. 硬件解码：JPEG → RGB565 ---- */
+    jpeg_decode_cfg_t dec_cfg = {
+        .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
+        /* 关键:LVGL 配置为 LV_COLOR_16_SWAP=0(小端 RGB565)。
+         * 硬件解码器 JPEG_DEC_RGB_ELEMENT_ORDER_RGB = 大端输出,
+         * 与 LVGL 期望相反 → 每个像素 2 字节对调 → 彩色条纹花屏。
+         * 改用 BGR = small endian, 与 LV_COLOR_16_SWAP=0 匹配。 */
+        .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
+        .conv_std = JPEG_YUV_RGB_CONV_STD_BT601,
+    };
+    uint32_t decoded_size = 0;
+    esp_err_t err = jpeg_decoder_process(jpeg_hdl, &dec_cfg,
+                                         jpg_buf, (uint32_t)sz,
+                                         full_buf, (uint32_t)alloc_size,
+                                         &decoded_size);
+    jpeg_del_decoder_engine(jpeg_hdl);
+    free(jpg_buf);          /* 输入数据不再需要 */
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "硬件解码失败: %s", esp_err_to_name(err));
+        heap_caps_free(full_buf); return NULL;
+    }
+    ESP_LOGD(TAG, "硬件解码完成: %lu bytes RGB565", (unsigned long)decoded_size);
+
+    /* 从 decoded_size 反推硬件解码器真实输出布局(dec_w/dec_h)。
+     * 解码器按 MCU 块对齐输出：dec_w = iw 上取整到 mcux，dec_h = ih 上取整到 mcuy。
+     * 不同采样格式(4:2:0=16x16 / 4:2:2=16x8 / 4:4:4=8x8)的 mcux/mcuy 不同，
+     * 导致真实行宽未必等于我们之前假设的 padded_w。从 decoded_size 精确反推，
+     * 即可用正确 stride 喂给 PPA，彻底消除"行宽错位 → 斜向彩色条纹"的问题。 */
+    uint32_t dec_w = 0, dec_h = 0;
+    {
+        const uint32_t mcux_cand[4] = {16, 16, 8, 8};
+        const uint32_t mcuy_cand[4] = {16, 8, 16, 8};
+        for (int i = 0; i < 4; i++) {
+            uint32_t ph = (iw + mcux_cand[i] - 1) / mcux_cand[i] * mcux_cand[i];
+            uint32_t pv = (ih + mcuy_cand[i] - 1) / mcuy_cand[i] * mcuy_cand[i];
+            if (ph * pv * 2 == decoded_size) { dec_w = ph; dec_h = pv; break; }
+        }
+    }
+    if (dec_w == 0) {
+        ESP_LOGW(TAG, "无法从 decoded_size=%lu 反推解码布局，回退 padded",
+                 (unsigned long)decoded_size);
+        dec_w = padded_w; dec_h = padded_h;
+    }
+    ESP_LOGI(TAG, "封面解码: 原图 %lux%lu, 解码布局(dec_w=%lu,dec_h=%lu, 行stride=%lu B), 输出 %ux%u",
+             (unsigned long)iw, (unsigned long)ih,
+             (unsigned long)dec_w, (unsigned long)dec_h, (unsigned long)(dec_w * 2),
+             (unsigned)ow, (unsigned)oh);
+
+    /* 硬件 DMA 写完 PSRAM 后 CPU cache 可能含旧数据 */
+    esp_cache_msync(full_buf, CACHE_ALIGN_UP((size_t)dec_w * dec_h * 2),
+                    ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+
+    /* ---- 7. 分配最终封面帧缓冲 ----
+     * 优先内部 RAM：规避 PSRAM 经 cache 读取时(被 LVGL 绘制读取)潜在的
+     * 一致性问题(表现为彩色条纹)。内部 RAM 不足时回退 PSRAM。 */
+    uint8_t *fb = (uint8_t *)heap_caps_aligned_calloc(64, 1, fb_size,
+                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (fb) {
+        ESP_LOGI(TAG, "封面帧缓冲分配于 内部RAM (%zu bytes)", fb_size);
+    } else {
+        fb = (uint8_t *)heap_caps_aligned_calloc(64, 1, fb_size,
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (fb) ESP_LOGI(TAG, "封面帧缓冲分配于 PSRAM (%zu bytes)", fb_size);
+    }
+    if (!fb) {
+        ESP_LOGE(TAG, "封面帧缓冲分配失败 (%zu bytes)", fb_size);
+        heap_caps_free(full_buf);
+        return NULL;
+    }
+
+    /* ---- 8. 如果需要缩放，用 PPA SRM 硬件缩放；否则直接拷贝 ---- */
+    if (iw != ow || ih != oh) {
+        ppa_client_handle_t ppa_client = NULL;
+        ppa_client_config_t client_cfg = {
+            .oper_type = PPA_OPERATION_SRM,
+            .max_pending_trans_num = 1,
+        };
+        if (ppa_register_client(&client_cfg, &ppa_client) != ESP_OK) {
+            heap_caps_free(full_buf); heap_caps_free(fb); return NULL;
+        }
+
+        /* calloc 写了零（cache dirty）→ 冲刷 dirty cache 行到 PSRAM，
+         * 这样 PPA DMA 写 PSRAM 后 cache 里只有 clean 旧数据（好处理） */
+        esp_cache_msync(fb, CACHE_ALIGN_UP(fb_size), ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+        ppa_srm_oper_config_t srm_cfg = {
+            .in = {
+                .buffer = full_buf,
+                .pic_w = dec_w,        /* 硬件解码器真实输出行宽 */
+                .pic_h = dec_h,        /* 硬件解码器真实输出行数 */
+                .block_w = iw,          /* 有效区域宽度(原始图宽) */
+                .block_h = ih,          /* 有效区域高度(原始图高) */
+                .block_offset_x = 0,
+                .block_offset_y = 0,
+                .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+            },
+            .out = {
+                .buffer = fb,
+                .buffer_size = fb_size,
+                .pic_w = ow,
+                .pic_h = oh,
+                .block_offset_x = 0,
+                .block_offset_y = 0,
+                .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+            },
+            .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+            .scale_x = (float)ow / (float)iw,
+            .scale_y = (float)oh / (float)ih,
+            .byte_swap = false,
+            .mode = PPA_TRANS_MODE_BLOCKING,
+        };
+
+        err = ppa_do_scale_rotate_mirror(ppa_client, &srm_cfg);
+        ppa_unregister_client(ppa_client);
+
+        /* PPA 通过 DMA 写 PSRAM → CPU cache 仍含旧数据（C2M 后的 clean 数据）→ 失效 */
+        esp_cache_msync(fb, CACHE_ALIGN_UP(fb_size), ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+
+        heap_caps_free(full_buf);   /* 全尺寸缓冲不再需要 */
+
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "PPA 缩放失败: %s", esp_err_to_name(err));
+            heap_caps_free(fb); return NULL;
+        }
+        ESP_LOGD(TAG, "PPA 缩放: %lu×%lu → %u×%u",
+                 (unsigned long)iw, (unsigned long)ih, ow, oh);
+    } else {
+        /* 原始尺寸已 ≤320px，无需缩放：按解码器真实 stride 逐行紧凑拷贝，
+         * 避免 full_buf 行宽(dec_w*2)与 iw*2 不一致导致逐行错位 → 彩色条纹 */
+        const uint8_t *src = full_buf;
+        uint8_t *dst = fb;
+        size_t row_bytes = (size_t)iw * 2;
+        for (uint32_t y = 0; y < ih; y++) {
+            memcpy(dst, src, row_bytes);
+            src += (size_t)dec_w * 2;
+            dst += row_bytes;
+        }
+        heap_caps_free(full_buf);
+        /* memcpy 通过 CPU 写入了 fb → 冲刷 cache 行到 PSRAM，确保一致性 */
+        esp_cache_msync(fb, CACHE_ALIGN_UP(fb_size), ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    }
+
+    /* 诊断：打印前 8 个 RGB565 像素(小端)，确认格式正确、非全零/非乱码 */
+    if (ow >= 8) {
+        const uint16_t *p = (const uint16_t *)fb;
+        ESP_LOGI(TAG, "封面像素样本[0..7]: %04X %04X %04X %04X %04X %04X %04X %04X",
+                 p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    }
+
+    *out_w = ow;
+    *out_h = oh;
+    return fb;
+}
+
+/* 从解码后的 RGB565 封面帧缓冲提取主色调色板（最多 max_n 个、互异鲜亮色）
+ * 返回实际提取数量，0 表示无有效颜色（如全黑/全白封面）。
+ * 算法：量化到 512 色桶统计频次 → 远点采样挑选互异颜色，首色为最频主色。 */
+static int extract_cover_palette(const uint8_t *fb, uint16_t w, uint16_t h,
+                                 uint8_t pal[][3], int max_n)
+{
+    if (fb == NULL || w == 0 || h == 0 || max_n <= 0) return 0;
+
+    typedef struct { uint32_t sum_r, sum_g, sum_b, cnt; } bucket_t;
+    static bucket_t buckets[512];
+    memset(buckets, 0, sizeof(buckets));
+
+    const uint16_t *p = (const uint16_t *)fb;
+    uint32_t total = (uint32_t)w * h;
+    uint32_t step = (total > 20000) ? 4 : 1;   /* 降采样控制开销 */
+
+    for (uint32_t i = 0; i < total; i += step) {
+        uint16_t px = p[i];
+        /* RGB565（R 在高位 5bit，小端存储）→ 8bit */
+        uint8_t r5 = (px >> 11) & 0x1F;
+        uint8_t g6 = (px >> 5)  & 0x3F;
+        uint8_t b5 = px & 0x1F;
+        uint8_t R = (r5 << 3) | (r5 >> 2);
+        uint8_t G = (g6 << 2) | (g6 >> 4);
+        uint8_t B = (b5 << 3) | (b5 >> 2);
+
+        uint32_t sum = (uint32_t)R + G + B;
+        if (sum < 36)  continue;   /* 近黑（暗角/边框） */
+        if (sum > 735) continue;   /* 近白（高光/白底） */
+
+        int idx = ((R >> 5) << 6) | ((G >> 5) << 3) | (B >> 5);  /* 每通道 3bit → 512 桶 */
+        buckets[idx].sum_r += R;
+        buckets[idx].sum_g += G;
+        buckets[idx].sum_b += B;
+        buckets[idx].cnt++;
+    }
+
+    /* 收集有效桶为候选色（桶均值） */
+    typedef struct { uint8_t r, g, b; uint32_t cnt; } cand_t;
+    cand_t cands[512];
+    int nc = 0;
+    for (int i = 0; i < 512; i++) {
+        if (buckets[i].cnt > 0) {
+            cands[nc].r   = (uint8_t)(buckets[i].sum_r / buckets[i].cnt);
+            cands[nc].g   = (uint8_t)(buckets[i].sum_g / buckets[i].cnt);
+            cands[nc].b   = (uint8_t)(buckets[i].sum_b / buckets[i].cnt);
+            cands[nc].cnt = buckets[i].cnt;
+            nc++;
+        }
+    }
+    if (nc == 0) return 0;
+
+    /* 远点采样：先选最频者，再依次选与已选集合距离最远者，保证互异 */
+    int picked[COVER_PAL_MAX];
+    int np = 0;
+    int best = 0;
+    for (int i = 1; i < nc; i++) if (cands[i].cnt > cands[best].cnt) best = i;
+    picked[np++] = best;
+
+    while (np < max_n && np < nc) {
+        int far = -1;
+        uint32_t far_d = 0;
+        for (int i = 0; i < nc; i++) {
+            int used = 0;
+            for (int k = 0; k < np; k++) if (picked[k] == i) { used = 1; break; }
+            if (used) continue;
+            uint32_t md = 0xFFFFFFFF;   /* 与已选集合的最小距离 */
+            for (int k = 0; k < np; k++) {
+                int j = picked[k];
+                int dr = (int)cands[i].r - cands[j].r;
+                int dg = (int)cands[i].g - cands[j].g;
+                int db = (int)cands[i].b - cands[j].b;
+                uint32_t d = (uint32_t)(dr * dr + dg * dg + db * db);
+                if (d < md) md = d;
+            }
+            if (md > far_d) { far_d = md; far = i; }
+        }
+        if (far < 0) break;
+        picked[np++] = far;
+    }
+
+    for (int i = 0; i < np; i++) {
+        pal[i][0] = cands[picked[i]].r;
+        pal[i][1] = cands[picked[i]].g;
+        pal[i][2] = cands[picked[i]].b;
+    }
+    return np;
+}
+
+/* 歌词行切换 → 用封面调色板下一色触发脉冲（多色循环，融合几种封面色） */
+static void led_trigger_cover_pulse(void)
+{
+    if (s_cover_palette_n <= 0) {
+        app_led_trigger_pulse(LED_SOFT_R, LED_SOFT_G, LED_SOFT_B);
+        return;
+    }
+    uint8_t *c = s_cover_palette[s_cover_palette_idx % s_cover_palette_n];
+    s_cover_palette_idx++;
+    app_led_trigger_pulse(c[0], c[1], c[2]);
+}
+
+/* 无封面时恢复纯黑背景 */
+static void app_music_screen_clear_cover(void)
+{
+    if (!lvgl_port_lock(0)) return;
+    if (s_cover_img)    lv_obj_add_flag(s_cover_img, LV_OBJ_FLAG_HIDDEN);
+    if (s_cover_darken) lv_obj_add_flag(s_cover_darken, LV_OBJ_FLAG_HIDDEN);
+    if (s_container)    lv_obj_set_style_bg_opa(s_container, LV_OPA_COVER, 0);
+    if (s_cover_dsc) { heap_caps_free((void *)s_cover_dsc); s_cover_dsc = NULL; }
+    if (s_cover_fb)  { heap_caps_free(s_cover_fb); s_cover_fb = NULL; }
+    s_cover_palette_n = 0;
+    s_cover_palette_idx = 0;
+    app_led_effects_set_base_color(LED_SOFT_R, LED_SOFT_G, LED_SOFT_B);
+    lvgl_port_unlock();
+}
+
+/* 创建封面背景图层（全屏 lv_img + 半透明遮罩），初始隐藏，置于最底层 */
+static void create_cover_background(void)
+{
+    s_cover_img = lv_img_create(lv_scr_act());
+    lv_obj_set_pos(s_cover_img, 0, 0);
+    lv_obj_set_size(s_cover_img, SCREEN_W, SCREEN_H);
+    lv_img_set_size_mode(s_cover_img, LV_IMG_SIZE_MODE_REAL);
+    lv_obj_add_flag(s_cover_img, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_cover_img, LV_OBJ_FLAG_CLICKABLE);
+
+    s_cover_darken = lv_obj_create(lv_scr_act());
+    lv_obj_set_pos(s_cover_darken, 0, 0);
+    lv_obj_set_size(s_cover_darken, SCREEN_W, SCREEN_H);
+    lv_obj_set_style_radius(s_cover_darken, 0, 0);
+    lv_obj_set_style_border_width(s_cover_darken, 0, 0);
+    lv_obj_set_style_pad_all(s_cover_darken, 0, 0);
+    lv_obj_set_style_bg_color(s_cover_darken, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_cover_darken, LV_OPA_60, 0);
+    lv_obj_add_flag(s_cover_darken, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_cover_darken, LV_OBJ_FLAG_CLICKABLE);
+}
+
+/* 设置专辑封面（path 为 SD 卡上 JPEG；NULL/空 → 清除封面恢复纯黑） */
+void app_music_screen_set_cover(const char *path)
+{
+    if (path == NULL || path[0] == '\0') {
+        app_music_screen_clear_cover();
+        return;
+    }
+
+    uint16_t w = 0, h = 0;
+    uint8_t *fb = decode_cover_to_rgb565(path, &w, &h);
+    if (fb == NULL) {
+        app_music_screen_clear_cover();
+        return;
+    }
+
+    if (!lvgl_port_lock(0)) {
+        heap_caps_free(fb);
+        return;
+    }
+
+    /* 释放旧封面（描述符 + 帧缓冲） */
+    if (s_cover_dsc) { heap_caps_free((void *)s_cover_dsc); s_cover_dsc = NULL; }
+    if (s_cover_fb)  { heap_caps_free(s_cover_fb); s_cover_fb = NULL; }
+
+    s_cover_fb = fb;
+    s_cover_dsc = (lv_img_dsc_t *)heap_caps_calloc(1, sizeof(lv_img_dsc_t), MALLOC_CAP_INTERNAL);
+    if (s_cover_dsc == NULL) {
+        heap_caps_free(fb);
+        lvgl_port_unlock();
+        return;
+    }
+    s_cover_dsc->header.always_zero = 0;
+    s_cover_dsc->header.w = w;
+    s_cover_dsc->header.h = h;
+    s_cover_dsc->header.cf = LV_IMG_CF_TRUE_COLOR;   /* LVGL8：按当前色彩深度(16bit=RGB565)解释帧缓冲 */
+    s_cover_dsc->data = s_cover_fb;
+    s_cover_dsc->data_size = (uint32_t)((size_t)w * h * 2);
+    lv_img_set_src(s_cover_img, s_cover_dsc);
+
+    /* cover-fit：等比放大至恰好覆盖全屏，溢出部分居中裁切 */
+    float zw = (float)SCREEN_W / (float)w;
+    float zh = (float)SCREEN_H / (float)h;
+    float z = (zw > zh) ? zw : zh;
+    int32_t zoom = (int32_t)(z * 256.0f);
+    if (zoom < 256) zoom = 256;
+    lv_img_set_zoom(s_cover_img, (uint16_t)zoom);
+
+    lv_obj_clear_flag(s_cover_img, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_cover_darken, LV_OBJ_FLAG_HIDDEN);
+    /* 容器透明，露出封面背景 */
+    lv_obj_set_style_bg_opa(s_container, LV_OPA_TRANSP, 0);
+
+    lvgl_port_unlock();
+
+    /* 提取封面主色调色板 → 驱动氛围灯（微光基色=主色，歌词脉冲循环取色） */
+    s_cover_palette_idx = 0;
+    s_cover_palette_n = extract_cover_palette(s_cover_fb, w, h,
+                                              s_cover_palette, COVER_PAL_MAX);
+    if (s_cover_palette_n > 0) {
+        app_led_effects_set_base_color(s_cover_palette[0][0],
+                                       s_cover_palette[0][1],
+                                       s_cover_palette[0][2]);
+    } else {
+        app_led_effects_set_base_color(LED_SOFT_R, LED_SOFT_G, LED_SOFT_B);
+    }
+}
+
 static void create_music_container(void)
 {
+    /* 先创建封面背景（置于最底层） */
+    create_cover_background();
+
     /* 全屏不透明容器（完全遮挡底层 GIF） */
     s_container = lv_obj_create(lv_scr_act());
     lv_obj_set_pos(s_container, 0, 0);

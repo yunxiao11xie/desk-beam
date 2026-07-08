@@ -33,7 +33,8 @@ idf_component_register(
          "app_deepseek_screen.c" "app_led_effects.c" "font_noto_sc_20.c"
     INCLUDE_DIRS "."
     REQUIRES hal_display hal_led hal_key hal_sdcard
+            esp_driver_jpeg esp_driver_ppa
     PRIV_REQUIRES lvgl esp_lvgl_port esp_wifi nvs_flash
-                 esp_websocket_client cjson
+                 esp_websocket_client cjson esp_mm
 )
 

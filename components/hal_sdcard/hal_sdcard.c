@@ -14,6 +14,9 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
 
 static const char *TAG = "hal_sdcard";
 
@@ -57,6 +60,21 @@ static sdmmc_slot_config_t slot_config_create(void)
 
 
 /* ================================================================
+ *  内部：确保缓存目录存在
+ *
+ *  FATFS 的 mkdir 在目录已存在时返回 -1 且 errno=EEXIST，
+ *  属正常情况，忽略之；其余错误仅告警不阻塞。
+ * ================================================================ */
+
+static void ensure_dir(const char *path)
+{
+    if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+        ESP_LOGW(TAG, "创建目录失败: %s (errno=%d)", path, errno);
+    }
+}
+
+
+/* ================================================================
  *  公共 API
  * ================================================================ */
 
@@ -80,7 +98,7 @@ esp_err_t hal_sdcard_mount(void)
     /* ---- 3. 挂载 FATFS（初始化 + 卡检测 + 挂载，一站式） ---- */
     esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
         .format_if_mount_failed = false,        /* 不自动格式化 */
-        .max_files              = 2,            /* 仅需少量文件句柄 */
+        .max_files              = 4,            /* 封面读+写 + 歌词缓存 + 预留 */
         .allocation_unit_size   = 16 * 1024,    /* 16 KB 簇对齐 */
         .disk_status_check_enable = false,
     };
@@ -114,6 +132,10 @@ esp_err_t hal_sdcard_mount(void)
                   + (512 * 1024 - 1)) / (512 * 1024),
                  (unsigned long)target_freq);
     }
+
+    /* 建立应用目录（封面 / 歌词缓存） */
+    ensure_dir(SD_MOUNT_POINT "/covers");
+    ensure_dir(SD_MOUNT_POINT "/lyrics");
 
     s_mounted = true;
     return ESP_OK;
